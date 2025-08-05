@@ -1,8 +1,9 @@
 import os
 import requests
 import json
-from datetime import datetime, time
+from datetime import datetime, timedelta
 import pytz
+from bs4 import BeautifulSoup
 
 # 配置参数
 WECOM_WEBHOOK = os.environ["WECOM_WEBHOOK"]
@@ -10,92 +11,71 @@ KV_API_URL = os.environ["KV_API_URL"]
 KV_API_TOKEN = os.environ["KV_API_TOKEN"]
 TIMEZONE = pytz.timezone('Asia/Shanghai')
 
-def get_shanghai_stocks():
-    """获取上交所新股公告"""
+def get_new_stocks():
+    """从新浪财经获取今日新股信息"""
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
     try:
+        url = "http://vip.stock.finance.sina.com.cn/corp/go.php/vRPD_NewStockIssue/page/1.phtml"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
-        response = requests.get(
-            "http://www.sse.com.cn/disclosure/announcement/listing/", 
-            headers=headers, 
-            timeout=15
-        )
-        response.encoding = 'utf-8'
+        response = requests.get(url, headers=headers, timeout=15)
+        response.encoding = 'gbk'  # 新浪使用GBK编码
         
-        # 解析HTML
-        from bs4 import BeautifulSoup
         soup = BeautifulSoup(response.text, 'html.parser')
-        stocks = []
+        table = soup.find('table', id='NewStockTable')
         
-        for item in soup.select('.sse_list_1 dl'):
-            date_span = item.select_one('dd span')
-            if date_span and date_span.text.strip() == today:
-                link = item.select_one('dd a')
-                if link and '上市' in link.get('title', ''):
-                    stocks.append({
-                        "title": link.get('title', ''),
-                        "url": f"http://www.sse.com.cn{link['href']}",
-                        "exchange": "上交所"
-                    })
-        return stocks
-    except Exception as e:
-        print(f"上交所爬取失败: {str(e)}")
-        return []
-
-def get_shenzhen_stocks():
-    """获取深交所新股公告"""
-    today = datetime.now(TIMEZONE).strftime("%Y%m%d")
-    try:
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "application/json, text/javascript, */*; q=0.01"
-        })
-        
-        # 获取初始Cookie
-        session.get("http://www.szse.cn/disclosure/listed/notice/", timeout=10)
-        
-        # 查询公告
-        response = session.post(
-            "http://www.szse.cn/api/disc/announcement/annList",
-            json={
-                "seDate": [f"{today}", f"{today}"],
-                "channelCode": ["listedNotice_disc"],
-                "pageSize": 20,
-                "pageNum": 1
-            },
-            timeout=15
-        )
+        if not table:
+            return []
         
         stocks = []
-        for item in response.json().get("data", []):
-            title = item.get("title", "")
-            if "上市" in title and ("创业板" in title or "主板" in title):
+        for row in table.find_all('tr')[1:]:  # 跳过表头
+            cols = row.find_all('td')
+            if len(cols) < 10:
+                continue
+                
+            # 提取关键信息
+            stock_date = cols[0].get_text().strip()
+            stock_code = cols[2].get_text().strip()
+            stock_name = cols[3].get_text().strip()
+            issue_price = cols[5].get_text().strip()
+            purchase_limit = cols[7].get_text().strip()
+            
+            # 检查是否是今天的新股
+            if stock_date == today:
                 stocks.append({
-                    "title": title,
-                    "url": f"http://www.szse.cn{item['attachPath']}",
-                    "exchange": "深交所"
+                    "code": stock_code,
+                    "name": stock_name,
+                    "price": issue_price,
+                    "limit": purchase_limit,
+                    "date": stock_date
                 })
+        
         return stocks
     except Exception as e:
-        print(f"深交所爬取失败: {str(e)}")
+        print(f"新股数据获取失败: {str(e)}")
         return []
 
-def send_wecom_message(stocks):
-    """发送企业微信消息"""
+def send_concise_message(stocks):
+    """发送简洁版新股信息"""
     if not stocks:
         return False, "无新股数据"
     
-    markdown_content = "## 📈 今日新股认购提醒\n\n"
-    for idx, stock in enumerate(stocks, 1):
-        markdown_content += f"{idx}. **{stock['exchange']}** [{stock['title']}]({stock['url']})\n"
+    # 创建简洁消息格式
+    content = "📈 今日新股认购提醒\n\n"
+    for stock in stocks:
+        content += (
+            f"**{stock['name']} ({stock['code']})**\n"
+            f"发行价: {stock['price']}元\n"
+            f"申购上限: {stock['limit']}股\n"
+            f"申购日期: {stock['date']}\n\n"
+        )
     
+    # 企业微信消息格式
     payload = {
         "msgtype": "markdown",
         "markdown": {
-            "content": markdown_content
+            "content": content
         }
     }
     
@@ -170,14 +150,14 @@ def main():
     
     # 获取新股数据
     print("获取新股数据...")
-    stocks = get_shanghai_stocks() + get_shenzhen_stocks()
+    stocks = get_new_stocks()
     
     if not stocks:
-        print("无新股数据")
+        print("今日无新股数据")
         return
     
-    # 发送消息
-    success, msg = send_wecom_message(stocks)
+    # 发送简洁消息
+    success, msg = send_concise_message(stocks)
     print(f"推送结果: {msg}")
     
     # 成功则记录状态
