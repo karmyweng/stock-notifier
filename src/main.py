@@ -1,9 +1,10 @@
 import os
 import requests
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, time
 import pytz
 from bs4 import BeautifulSoup
+import re
 
 # 配置参数
 WECOM_WEBHOOK = os.environ["WECOM_WEBHOOK"]
@@ -12,12 +13,14 @@ KV_API_TOKEN = os.environ["KV_API_TOKEN"]
 TIMEZONE = pytz.timezone('Asia/Shanghai')
 
 def get_new_stocks():
-    """从新浪财经获取今日新股信息"""
+    """从新浪财经获取今日新股信息（优化版）"""
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
     try:
         url = "http://vip.stock.finance.sina.com.cn/corp/go.php/vRPD_NewStockIssue/page/1.phtml"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9"
         }
         response = requests.get(url, headers=headers, timeout=15)
         response.encoding = 'gbk'  # 新浪使用GBK编码
@@ -26,6 +29,7 @@ def get_new_stocks():
         table = soup.find('table', id='NewStockTable')
         
         if not table:
+            print("未找到新股表格")
             return []
         
         stocks = []
@@ -43,6 +47,9 @@ def get_new_stocks():
             
             # 检查是否是今天的新股
             if stock_date == today:
+                # 提取纯数字代码（去除非数字字符）
+                stock_code = re.sub(r'\D', '', stock_code)
+                
                 stocks.append({
                     "code": stock_code,
                     "name": stock_name,
@@ -64,11 +71,12 @@ def send_concise_message(stocks):
     # 创建简洁消息格式
     content = "📈 今日新股认购提醒\n\n"
     for stock in stocks:
+        # 确保信息长度适中
+        name = stock['name'][:10]  # 限制名称长度
         content += (
-            f"**{stock['name']} ({stock['code']})**\n"
+            f"**{name} ({stock['code']})**\n"
             f"发行价: {stock['price']}元\n"
-            f"申购上限: {stock['limit']}股\n"
-            f"申购日期: {stock['date']}\n\n"
+            f"申购上限: {stock['limit']}\n\n"
         )
     
     # 企业微信消息格式
@@ -98,35 +106,37 @@ def get_kv_state():
         )
         if resp.status_code == 200:
             return resp.json().get("last_sent_date", "")
-    except:
-        pass
+    except Exception as e:
+        print(f"获取KV状态失败: {str(e)}")
     return ""
 
 def set_kv_state(date):
     """设置Cloudflare KV状态"""
     try:
-        requests.put(
+        resp = requests.put(
             f"{KV_API_URL}/state",
             json={"last_sent_date": date},
             headers={"Authorization": f"Bearer {KV_API_TOKEN}"},
             timeout=5
         )
-        return True
-    except:
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"设置KV状态失败: {str(e)}")
         return False
 
 def is_trading_time():
     """检查是否为交易时段"""
     now = datetime.now(TIMEZONE)
+    current_time = now.time()
     
     # 周一至周五
     if now.weekday() >= 5:
         return False
     
-    current_time = now.time()
     # 上午交易时间 9:30-11:30
     if time(9, 30) <= current_time <= time(11, 30):
         return True
+    
     # 下午交易时间 13:00-15:00
     if time(13, 0) <= current_time <= time(15, 0):
         return True
@@ -154,7 +164,11 @@ def main():
     
     if not stocks:
         print("今日无新股数据")
+        # 发送无新股通知
+        send_concise_message([])
         return
+    
+    print(f"发现 {len(stocks)} 只新股")
     
     # 发送简洁消息
     success, msg = send_concise_message(stocks)
